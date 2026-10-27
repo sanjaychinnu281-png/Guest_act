@@ -5,3 +5,4 @@ pycryptodome>=3.20
 google-play-scraper>=1.2.7
 protobuf>=4.25
 protobuf-decoder>=0.1.2
+aiohttp>=3.9
