@@ -1,6 +1,6 @@
 # ============================================================
-#  GUEST ACTIVATOR - PREMIUM TELEGRAM BOT
-#  Requires: act.py (with CHINNUTEAM_pb2 integration)
+#  GUEST ACTIVATOR - PREMIUM TELEGRAM BOT  (Render Webhook)
+#  Requires: act.py, CHINNUTEAM_pb2.py
 # ============================================================
 import asyncio
 import json
@@ -10,6 +10,7 @@ import html
 import tempfile
 from datetime import datetime
 
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import (
@@ -18,17 +19,27 @@ from aiogram.types import (
 )
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 import act
 
 # ==================== CONFIG ====================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8950405557:AAHXDOtxKQZjhHGOK2p96ni72GAteroKrM4").strip()
-MAX_ACCOUNTS = 2000
-PER_ACCOUNT_TIMEOUT = 90.0
-PROGRESS_INTERVAL = 2.5  # Fast updates for premium feel
-
 if not BOT_TOKEN:
     raise SystemExit("BOT_TOKEN env variable is missing.")
+
+# Render auto-provides RENDER_EXTERNAL_URL for web services.
+# Fallback to manual WEBHOOK_HOST env var if you want to override.
+WEBHOOK_HOST = os.getenv("WEBHOOK_HOST") or os.getenv("RENDER_EXTERNAL_URL") or ""
+WEBHOOK_HOST = WEBHOOK_HOST.rstrip("/")
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}" if WEBHOOK_HOST else ""
+
+PORT = int(os.getenv("PORT", "8080"))
+
+MAX_ACCOUNTS = 2000
+PER_ACCOUNT_TIMEOUT = 90.0
+PROGRESS_INTERVAL = 2.5
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
@@ -40,17 +51,15 @@ _lock = asyncio.Lock()
 
 # ==================== UI COMPONENTS ====================
 def get_main_menu():
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+    return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📁 How to use", callback_data="help_menu")],
-        [InlineKeyboardButton(text="⚡ System Status", callback_data="status_menu")]
+        [InlineKeyboardButton(text="⚡ System Status", callback_data="status_menu")],
     ])
-    return kb
 
 def get_cancel_button():
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+    return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🛑 STOP JOB", callback_data="cancel_job")]
     ])
-    return kb
 
 def esc(s):
     return html.escape(str(s) if s is not None else "")
@@ -81,10 +90,11 @@ async def cb_help(callback: CallbackQuery):
 async def cb_status(callback: CallbackQuery):
     text = (
         "⚙️ <b>System Status</b>\n\n"
-        "🟢 <b>Engine:</b> Online\n"
+        "🟢 <b>Engine:</b> Online (Webhook Mode)\n"
         f"⚡ <b>Batch Size:</b> {act.BATCH_SIZE} accounts\n"
         f"🚀 <b>Concurrency:</b> {act.LOGIN_CONCURRENCY} threads\n"
-        f"⏱ <b>Timeout:</b> {PER_ACCOUNT_TIMEOUT}s per account"
+        f"⏱ <b>Timeout:</b> {PER_ACCOUNT_TIMEOUT}s per account\n"
+        f"🌐 <b>Webhook:</b> {'Set' if WEBHOOK_URL else 'Not configured'}"
     )
     await callback.message.answer(text)
     await callback.answer()
@@ -94,13 +104,15 @@ async def cb_cancel(callback: CallbackQuery):
     uid = callback.from_user.id
     async with _lock:
         ev = _cancel_events.get(uid)
-    
+
     if ev and not ev.is_set():
         ev.set()
-        await callback.message.edit_text("🛑 <b>Stopping...</b>\nFinishing current batch, please wait.")
+        await callback.message.edit_text(
+            "🛑 <b>Stopping...</b>\nFinishing current batch, please wait."
+        )
     else:
         await callback.answer("No active job to cancel.", show_alert=True)
-    
+
     await callback.answer()
 
 # ==================== COMMANDS ====================
@@ -119,9 +131,6 @@ async def cmd_start(msg: Message):
 
 @dp.message(Command("help"))
 async def cmd_help(msg: Message):
-    await cb_help_logic(msg)
-
-async def cb_help_logic(msg):
     text = (
         "📖 <b>Help Menu</b>\n\n"
         "Just send me a <code>.json</code> file and I will process it automatically.\n"
@@ -165,7 +174,9 @@ async def handle_doc(msg: Message):
             return
 
         if len(accounts) > MAX_ACCOUNTS:
-            await status.edit_text(f"❌ <b>Limit Exceeded.</b>\nMax allowed is {MAX_ACCOUNTS} accounts.")
+            await status.edit_text(
+                f"❌ <b>Limit Exceeded.</b>\nMax allowed is {MAX_ACCOUNTS} accounts."
+            )
             return
 
         results = {"active": [], "failed": []}
@@ -175,8 +186,7 @@ async def handle_doc(msg: Message):
         started = time.time()
         last_edit = 0.0
 
-        # Initial Progress UI
-        pct = 0
+        pct = 0.0
         bar = generate_progress_bar(pct)
         prog_text = (
             f"⚡ <b>ACTIVATING ACCOUNTS</b>\n"
@@ -191,78 +201,77 @@ async def handle_doc(msg: Message):
         prog_msg = await status.edit_text(prog_text, reply_markup=get_cancel_button())
 
         async def update_progress(force=False):
-            nonlocal last_edit, processed
+            nonlocal last_edit
             now = time.time()
             if not force and now - last_edit < PROGRESS_INTERVAL:
                 return
             last_edit = now
-            
+
             active_count = len(results["active"])
             failed_count = len(results["failed"])
-            pct = (processed / total) * 100
-            bar = generate_progress_bar(pct)
+            pct_local = (processed / total) * 100 if total else 0
+            bar_local = generate_progress_bar(pct_local)
             elapsed = now - started
             rate = (processed / elapsed) if elapsed > 0 else 0
 
             text = (
                 f"⚡ <b>ACTIVATING ACCOUNTS</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"<code>[{bar}]</code> {pct:.1f}%\n\n"
+                f"<code>[{bar_local}]</code> {pct_local:.1f}%\n\n"
                 f"📦 <b>Total:</b> {total}\n"
                 f"✅ <b>Active:</b> {active_count}\n"
                 f"❌ <b>Failed:</b> {failed_count}\n"
                 f"⏱ <b>Speed:</b> {rate:.1f} acc/s\n"
                 f"🕒 <b>Time:</b> {elapsed:.1f}s\n\n"
-                f"<i>Processing batch {processed}/{total}...</i>"
+                f"<i>Processing {processed}/{total}...</i>"
             )
             try:
                 await prog_msg.edit_text(text, reply_markup=get_cancel_button())
             except Exception:
                 pass
 
-        # Batching loop
         bs = act.BATCH_SIZE
         for i in range(0, total, bs):
             if cancel_ev.is_set():
                 break
-                
+
             batch = accounts[i:i + bs]
-            
-            # Wrap act.activate_single_account with a timeout
+
             async def safe_activate(acc, idx):
                 try:
                     return await asyncio.wait_for(
                         act.activate_single_account(acc, idx, total, results, rlock),
-                        timeout=PER_ACCOUNT_TIMEOUT
+                        timeout=PER_ACCOUNT_TIMEOUT,
                     )
                 except asyncio.TimeoutError:
-                    uid_str = str(acc.get("uid") or acc.get("token", "")[:16] or "unknown")
+                    uid_str = str(
+                        acc.get("uid") or acc.get("token", "")[:16] or "unknown"
+                    )
                     async with rlock:
                         results["failed"].append({"uid": uid_str, "reason": "timeout"})
                     return False
 
             tasks = [safe_activate(acc, i + j + 1) for j, acc in enumerate(batch)]
             await asyncio.gather(*tasks, return_exceptions=True)
-            
+
             processed += len(batch)
             await update_progress()
-            
+
             if i + bs < total and not cancel_ev.is_set():
                 await asyncio.sleep(act.BATCH_INTERVAL)
 
         cancelled = cancel_ev.is_set()
         await update_progress(force=True)
-        
-        # Finalizing UI
+
         try:
-            final_pct = (processed / total) * 100
+            final_pct = (processed / total) * 100 if total else 100
             final_bar = generate_progress_bar(final_pct)
             status_word = "CANCELLED" if cancelled else "COMPLETED"
-            
+
             final_text = (
                 f"{'🛑' if cancelled else '✅'} <b>JOB {status_word}</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"<code>[{final_bar}]</code> 100%\n\n"
+                f"<code>[{final_bar}]</code> {final_pct:.0f}%\n\n"
                 f"📦 <b>Processed:</b> {processed}/{total}\n"
                 f"✅ <b>Active:</b> {len(results['active'])}\n"
                 f"❌ <b>Failed:</b> {len(results['failed'])}\n"
@@ -278,15 +287,15 @@ async def handle_doc(msg: Message):
 
         if active:
             res_text = "✅ <b>ACTIVE ACCOUNTS</b>\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            for i, a in enumerate(active[:30], 1):
-                res_text += f"{i}. <code>{esc(a['uid'])}</code> | Lvl {esc(a['level'])} | {esc(a['nickname'])} | {esc(a['region'])}\n"
-            
+            for idx, a in enumerate(active[:30], 1):
+                res_text += (
+                    f"{idx}. <code>{esc(a['uid'])}</code> | "
+                    f"Lvl {esc(a['level'])} | {esc(a['nickname'])} | {esc(a['region'])}\n"
+                )
             if len(active) > 30:
                 res_text += f"\n<i>...and {len(active) - 30} more (see attached file).</i>"
-                
             await msg.answer(res_text)
 
-        # Prepare JSON file
         out = {
             "summary": {
                 "total_active": len(active),
@@ -297,19 +306,23 @@ async def handle_doc(msg: Message):
             "active_accounts": active,
             "failed_accounts": failed,
         }
-        out_path = os.path.join(tempfile.gettempdir(), f"result_{uid}_{int(time.time())}.json")
+        out_path = os.path.join(
+            tempfile.gettempdir(), f"result_{uid}_{int(time.time())}.json"
+        )
         try:
             with open(out_path, "w", encoding="utf-8") as fp:
                 json.dump(out, fp, indent=4, ensure_ascii=False)
-            
+
             await msg.answer_document(
                 FSInputFile(out_path, filename=f"GUEST_RESULTS_{doc.file_name}"),
                 caption="📁 <b>Full JSON Report</b>\nDownload to see all active and failed accounts.",
             )
         finally:
             if os.path.exists(out_path):
-                try: os.remove(out_path)
-                except Exception: pass
+                try:
+                    os.remove(out_path)
+                except Exception:
+                    pass
 
     except Exception as e:
         try:
@@ -321,14 +334,77 @@ async def handle_doc(msg: Message):
             _active_users.discard(uid)
             _cancel_events.pop(uid, None)
         if tmp_path and os.path.exists(tmp_path):
-            try: os.remove(tmp_path)
-            except Exception: pass
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+# ==================== WEBHOOK / HEALTH ====================
+async def health(_request):
+    return web.Response(
+        text=json.dumps({
+            "status": "ok",
+            "bot": "GUEST ACTIVATOR PRO",
+            "webhook": WEBHOOK_URL or "not-set",
+            "time": datetime.utcnow().isoformat() + "Z",
+        }),
+        content_type="application/json",
+    )
+
+async def on_startup(bot: Bot):
+    if not WEBHOOK_URL:
+        print("[WARN] No WEBHOOK_URL / RENDER_EXTERNAL_URL set. Webhook not registered.")
+        return
+    try:
+        await bot.set_webhook(
+            WEBHOOK_URL,
+            drop_pending_updates=True,
+            allowed_updates=dp.resolve_used_update_types(),
+        )
+        print(f"[OK] Webhook set -> {WEBHOOK_URL}")
+    except Exception as e:
+        print(f"[ERR] set_webhook failed: {e}")
+
+async def on_shutdown(bot: Bot):
+    try:
+        await bot.delete_webhook()
+        print("[OK] Webhook removed.")
+    except Exception as e:
+        print(f"[WARN] delete_webhook: {e}")
+
+async def close_client():
+    try:
+        await act.client.aclose()
+    except Exception:
+        pass
 
 # ==================== MAIN ====================
 async def main():
-    print("🤖 GUEST ACTIVATOR PRO is starting...")
-    await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    print("🤖 GUEST ACTIVATOR PRO starting (webhook mode)...")
+
+    dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
+
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/healthz", health)
+
+    webhook_handler = SimpleRequestHandler(dispatcher=dp, bot=bot, secret_token=None)
+    webhook_handler.register(app, path=WEBHOOK_PATH)
+
+    setup_application(app, dp, bot=bot)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    print(f"[OK] HTTP server listening on 0.0.0.0:{PORT}")
+
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await close_client()
+        await runner.cleanup()
 
 if __name__ == "__main__":
     try:
