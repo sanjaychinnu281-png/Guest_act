@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: guest-activator-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.0"
+      - key: BOT_TOKEN
+        sync: false          # paste in Dashboard
+      - key: WEBHOOK_HOST
+        sync: false          # e.g. https://guest-activator-bot.onrender.com (optional)
